@@ -1,8 +1,9 @@
-"""Android boot image: gzip(BootShim + UEFI FD) with the device tree appended, plus an optional ramdisk.
+"""Android boot image: gzip(BootShim + UEFI FD) with an optional appended device tree and ramdisk.
 
 Inputs are a Mu-Silicium checkout (BootShim sources, Resources/Configs/<device>.toml, mkbootimg.py),
-the built firmware volume and a compiled device tree. The image is meant for "fastboot boot" only.
-The result is verified by unpacking it again; the output is deterministic.
+the built firmware volume and a compiled device tree. [boot_shim] presence and
+boot_image_kernel.append_dtb follow the Mu-Silicium device config. The result is verified by
+unpacking it again; the output is deterministic.
 """
 import gzip
 import hashlib
@@ -65,20 +66,25 @@ def settings(ctx, uefi):
     values.update(config.get('boot_image', {}))
     values.update(ctx.board.get('bootimg', {}).get('image', {}))
     fd = config.get('uefi_fd', {})
-    return values, fd.get('base'), fd.get('size'), config.get('boot_shim', {}).get('requires_kernel_header', True), config
+    kernel = {'kernel_compression': 'gzip', 'append_dtb': False}
+    kernel.update(config.get('boot_image_kernel', {}))
+    return values, fd.get('base'), fd.get('size'), config.get('boot_shim'), kernel, config
 
 
 def build(ctx, uefi, fd, dtb, ramdisk=None, output=None):
     log('bootimg')
-    image, base, size, requires_header, config = settings(ctx, uefi)
+    image, base, size, shim_config, kernel_config, config = settings(ctx, uefi)
+    append_dtb = kernel_config.get('append_dtb', False)
+    compression = kernel_config.get('kernel_compression', 'gzip')
+    if compression != 'gzip':
+        raise Error(f'unsupported boot_image_kernel.kernel_compression {compression!r}: only gzip is implemented')
     mkbootimg = uefi / 'Resources/Scripts/mkbootimg.py'
     if not mkbootimg.is_file():
         raise Error(f'{mkbootimg} missing: --uefi must be a Mu-Silicium checkout')
-    for path, what in ((fd, 'firmware volume (--fd)'), (dtb, 'device tree (--dtb)')):
-        if not path or not Path(path).is_file():
-            if path == fd:
-                raise Error(f'firmware volume not found: {fd}; run ./unixnu build firmware --uefi {uefi}')
-            raise Error(f'{what} not found: {path}')
+    if not fd or not Path(fd).is_file():
+        raise Error(f'firmware volume not found: {fd}; run ./unixnu build firmware --uefi {uefi}')
+    if append_dtb and (not dtb or not Path(dtb).is_file()):
+        raise Error(f'device tree not found: {dtb} (boot_image_kernel.append_dtb is enabled)')
     firmware = Path(fd).read_bytes()
     if base is None or size is None:
         raise Error('the Mu-Silicium device config has no [uefi_fd] base and size')
@@ -88,10 +94,14 @@ def build(ctx, uefi, fd, dtb, ramdisk=None, output=None):
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='unixnu-bootimg-') as scratch_name:
         scratch = Path(scratch_name)
-        shim = compile_shim(uefi, base, size, requires_header, scratch)
-        tree = patch_dtb(Path(dtb).read_bytes(), ctx.board.get('bootimg', {}).get('dtb_node', []), scratch)
-        if tree[:4] != b'\xd0\x0d\xfe\xed' or struct.unpack_from('>I', tree, 4)[0] != len(tree):
-            raise Error('invalid compiled device tree')
+        shim = b''
+        if shim_config is not None:
+            shim = compile_shim(uefi, base, size, shim_config.get('requires_kernel_header', False), scratch)
+        tree = b''
+        if append_dtb:
+            tree = patch_dtb(Path(dtb).read_bytes(), ctx.board.get('bootimg', {}).get('dtb_node', []), scratch)
+            if tree[:4] != b'\xd0\x0d\xfe\xed' or struct.unpack_from('>I', tree, 4)[0] != len(tree):
+                raise Error('invalid compiled device tree')
         combined = shim + firmware
         kernel = gzip.compress(combined, mtime=0) + tree
         kernel_path = scratch / 'Image.gz-dtb'
@@ -110,7 +120,9 @@ def build(ctx, uefi, fd, dtb, ramdisk=None, output=None):
         run(command, capture=True)
         report = verify(out, combined, tree, ramdisk_path, image)
     report.update(image_sha256=sha256_file(out), image_bytes=out.stat().st_size, fd_sha256=sha256_file(fd),
-                  dtb_sha256=sha256_file(dtb), shim_bytes=len(shim), hardware_tested=False)
+                  shim_bytes=len(shim), hardware_tested=False)
+    if append_dtb:
+        report['dtb_sha256'] = sha256_file(dtb)
     (out.parent / 'boot.json').write_text(json.dumps(report, indent=2) + '\n')
     log(f'bootimg: {out} ({out.stat().st_size} bytes)')
     return out
@@ -119,11 +131,31 @@ def build(ctx, uefi, fd, dtb, ramdisk=None, output=None):
 def verify(path, combined, tree, ramdisk_path, image):
     """Unpack the image and compare every part with its input."""
     data = Path(path).read_bytes()
-    kernel_size, kernel_address, ramdisk_size, _, second_size, _, tags, page, version, _ = struct.unpack_from('<10I', data, 8)
-    if data[:8] != b'ANDROID!' or second_size or version != image['header_version'] or page != image['pagesize']:
+    if data[:8] != b'ANDROID!':
+        raise Error('not an Android boot image')
+    version = struct.unpack_from('<I', data, 40)[0]
+    if version != image['header_version']:
         raise Error('boot image header does not match the requested parameters')
-    if kernel_address != image['base'] + image['kernel_offset'] or tags != image['base'] + image['tags_offset']:
-        raise Error('boot image load addresses do not match the requested offsets')
+    if version >= 3:
+        # v3/v4: fixed 4096-byte pages, header size 1580/1584, no load addresses.
+        kernel_size, ramdisk_size = struct.unpack_from('<2I', data, 8)
+        header_size = struct.unpack_from('<I', data, 20)[0]
+        if header_size != (1580, 1584)[version - 3]:
+            raise Error('boot image header size does not match the header version')
+        if version == 4 and struct.unpack_from('<I', data, 1580)[0] != 4096:
+            raise Error('boot image v4 signature size is not 4096 bytes')
+        page = 4096
+        kernel_address = tags_address = None
+        expected = page * (1 + -(-kernel_size // page) + -(-ramdisk_size // page)) + (4096 if version == 4 else 0)
+        if len(data) != expected:
+            raise Error(f'boot image is {len(data)} bytes, expected {expected}')
+    else:
+        kernel_size, kernel_address, ramdisk_size, _, second_size, _, tags, page, _, _ = struct.unpack_from('<10I', data, 8)
+        if second_size or page != image['pagesize']:
+            raise Error('boot image header does not match the requested parameters')
+        if kernel_address != image['base'] + image['kernel_offset'] or tags != image['base'] + image['tags_offset']:
+            raise Error('boot image load addresses do not match the requested offsets')
+        kernel_address, tags_address = hex(kernel_address), hex(tags)
     kernel = data[page:page + kernel_size]
     unpacker = zlib.decompressobj(16 + zlib.MAX_WBITS)
     if unpacker.decompress(kernel) != combined or not unpacker.eof or unpacker.unused_data != tree:
@@ -132,4 +164,4 @@ def verify(path, combined, tree, ramdisk_path, image):
     if data[start:start + ramdisk_size] != Path(ramdisk_path).read_bytes():
         raise Error('ramdisk bytes differ')
     return {'kernel_sha256': hashlib.sha256(kernel).hexdigest(), 'ramdisk_bytes': ramdisk_size,
-            'header_version': version, 'kernel_address': hex(kernel_address), 'tags_address': hex(tags)}
+            'header_version': version, 'kernel_address': kernel_address, 'tags_address': tags_address}

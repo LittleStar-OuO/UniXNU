@@ -144,17 +144,7 @@
  #endif
  
  	throttle_init();
-@@ -773,7 +775,9 @@
- 
- #if defined(XNU_SHENG_PMGR) && XNU_SHENG_PMGR
- 	extern void sheng_pmgr_run(void);
-+	boot_progress_stage("original PMGR nub start");
- 	sheng_pmgr_run();
-+	boot_progress_stage("original PMGR nub returned");
- #endif
- 
- 	/*
-@@ -1010,7 +1014,9 @@
+@@ -1010,7 +1010,9 @@
  #endif
  
  		bsd_init_kprintf("vfs_mountroot\n");

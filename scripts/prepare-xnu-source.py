@@ -17,12 +17,18 @@ URL = f'https://api.github.com/repos/apple-oss-distributions/xnu/contents/iokit/
 # Anonymous GitHub API calls share a small per-address quota that hosted CI runners exhaust (HTTP 403);
 # a token in GITHUB_TOKEN or GH_TOKEN is sent to GitHub hosts only.
 TOKEN = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+# Download-only mirror for hosts that cannot reach GitHub directly; the URL is prefixed, so the
+# token never leaves the original GitHub host.
+PROXY = os.environ.get('UNIXNU_GITHUB_PROXY', '').rstrip('/')
 
 
 def fetch(url):
     request = urllib.request.Request(url, headers={'User-Agent': 'unixnu-prepare-xnu-source'})
     if TOKEN and urllib.parse.urlsplit(url).hostname in ('api.github.com', 'raw.githubusercontent.com'):
         request.add_header('Authorization', f'Bearer {TOKEN}')
+    if PROXY and urllib.parse.urlsplit(url).hostname in ('api.github.com', 'raw.githubusercontent.com'):
+        url = f'{PROXY}/{url}'
+        request = urllib.request.Request(url, headers={'User-Agent': 'unixnu-prepare-xnu-source'})
     with urllib.request.urlopen(request, timeout=30) as response:
         return response.read()
 
