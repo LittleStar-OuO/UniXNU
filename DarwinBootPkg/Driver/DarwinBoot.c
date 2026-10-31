@@ -21,6 +21,102 @@
 #define BLOCK_SIZE   SIZE_2MB
 #define MAX_SEGMENTS 64
 
+//
+// Temporary diag69 probe: after the segment copy the loader records what it
+// can see of the prelink record page in both the file buffer and the window,
+// plus the segment table, at ArgsAddress + 0x800 (the boot_args struct ends at
+// 0x480 and the device tree starts at +0x1000). The entry cave compares these
+// against its own reads. Remove once the record-page question is settled.
+//
+#define DARWINBOOT_LOADER_PROBES   1
+#define LOADER_PROBE_OFFSET        0x800
+#define LOADER_PROBE_MAGIC         0x45424F5250363944ULL  /* "D96PROBE" */
+#define LOADER_PROBE_REC_PAGE_VA   0xFFFFFFF005CB3000ULL
+#define LOADER_PROBE_NAME_OFF      0x168
+#define LOADER_PROBE_FLAGS_OFF     0x180
+
+//
+// diag71: BootRamdiskDxe records what the decompressed FAT image holds at the
+// same record page and at the entry instruction, before the FAT driver reads
+// it, and copies the block to a fixed page in the boot payload window. The
+// layout must match PAYLOAD_PROBE_BLOCK in BootRamdiskDxe.c.
+//
+#define PAYLOAD_PROBE_MAGIC        0x3037505244ULL  /* "DRP70" */
+#define PAYLOAD_PROBE_PAGE         0x413FF000ULL
+#define PAYLOAD_PROBE_VOL_REC      0x01917A00ULL
+#define PAYLOAD_PROBE_VOL_ENTRY    0x028B5688ULL
+
+//
+// Auto-return to fastboot. LK boots boot_a again on any reset, so a stall inside this loader would sit
+// in firmware until someone held the buttons (diag72 did exactly that). While boot services are alive,
+// a one-shot timer writes the reboot-mode syscon value LK takes for fastboot and issues the same PSCI
+// SYSTEM_RESET the diag cave uses. ExitBootServices stops boot-services timers, so a hand-off that
+// reaches the kernel never sees it.
+//
+#define BOOT_WATCHDOG_SYSCON       0x1C007000ULL
+#define BOOT_WATCHDOG_MODE_OFF     0x24
+#define BOOT_WATCHDOG_MODE_MASK    0xF
+#define BOOT_WATCHDOG_FASTBOOT     3
+#define BOOT_WATCHDOG_SECONDS      120
+
+typedef struct {
+  UINT64  Magic;
+  UINT64  Destination;
+  UINT64  Size;
+  UINT64  RecSig;
+  UINT64  RecName;
+  UINT64  RecFlags;
+  UINT64  Entry;
+} PAYLOAD_PROBE_BLOCK;
+
+typedef struct {
+  UINT64  Magic;
+  UINT64  VirtualBase;
+  UINT64  PhysicalBase;
+  UINT64  Used;
+  UINT64  WindowSize;
+  UINT64  Count;
+  UINT64  Entry;
+  UINT64  Reserved;
+  UINT64  Segments[32][2];   /* Address, FileSize */
+  UINT64  RecWinSig;
+  UINT64  RecFileSig;
+  UINT64  RecWinName;
+  UINT64  RecFileName;
+  UINT64  RecWinFlags;
+  UINT64  RecFileFlags;
+  UINT64  RecCompare;
+  UINT64  RecWinSum;
+  UINT64  RecFileSum;
+  UINT64  EntryWin;
+  UINT64  EntryFile;
+  UINT64  Word0Win;
+  UINT64  Word0File;
+  UINT64  RecFileOffset;
+  UINT64  EntryFileOffset;
+  UINT64  VolMagic;
+  UINT64  VolDestination;
+  UINT64  VolSize;
+  UINT64  VolRecSig;
+  UINT64  VolRecName;
+  UINT64  VolRecFlags;
+  UINT64  VolEntry;
+  UINT64  ImagePtr;
+  UINT64  ImageSize;
+  UINT64  WindowPtr;
+  UINT64  VolNowSig;
+  UINT64  VolNowName;
+  UINT64  VolNowFlags;
+  UINT64  VolNowSum;
+  UINT64  VolEntryNow;
+  UINT64  FreshSig;
+  UINT64  FreshName;
+  UINT64  FreshFlags;
+  UINT64  FreshSum;
+  UINT64  FreshStatus;
+  UINT64  FreshActual;
+} LOADER_PROBE_BLOCK;
+
 typedef struct {
   UINT64  Address;
   UINT64  Size;
@@ -39,12 +135,45 @@ typedef struct {
 
 STATIC EFI_HANDLE  mImage;
 UINT64 EFIAPI DarwinCurrentEl (VOID);
-VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
+VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes, UINT64 Used);
 
 #define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
 
 STATIC UINT32 U32 (CONST VOID *P) { return ReadUnaligned32 ((CONST UINT32 *)P); }
 STATIC UINT64 U64 (CONST VOID *P) { return ReadUnaligned64 ((CONST UINT64 *)P); }
+
+STATIC
+UINT64
+SegmentFileOffset (
+  KERNEL *Kernel,
+  UINT64  Address
+  )
+{
+  UINTN  Index;
+
+  for (Index = 0; Index < Kernel->Count; Index++) {
+    if ((Address >= Kernel->Segments[Index].Address) &&
+        (Address - Kernel->Segments[Index].Address < Kernel->Segments[Index].FileSize)) {
+      return Kernel->Segments[Index].FileOffset + (Address - Kernel->Segments[Index].Address);
+    }
+  }
+
+  return MAX_UINT64;
+}
+
+STATIC
+UINT64
+PageByteSum (
+  CONST UINT8 *Data,
+  UINTN        Size
+  )
+{
+  UINT64  Sum;
+  UINTN   Index;
+
+  for (Sum = 0, Index = 0; Index < Size; Index++) { Sum += Data[Index]; }
+  return Sum;
+}
 
 STATIC
 EFI_STATUS
@@ -397,6 +526,46 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
 }
 
 STATIC
+VOID
+DiagProbeRows (CONST LOADER_PROBE_BLOCK *Probe)
+{
+  CHAR16  Line[96];
+
+  UnicodeSPrint (Line, sizeof (Line), L"VOL  %016lx %lx", Probe->VolDestination, Probe->VolSize);
+  DiagDraw (Line, 0);
+  UnicodeSPrint (Line, sizeof (Line), L"VNOW %016lx S%lx", Probe->VolNowSig, Probe->VolNowSum);
+  DiagDraw (Line, 1);
+  UnicodeSPrint (Line, sizeof (Line), L"VENT %016lx", Probe->VolEntryNow);
+  DiagDraw (Line, 2);
+  UnicodeSPrint (Line, sizeof (Line), L"IMG  %016lx %lx", Probe->ImagePtr, Probe->ImageSize);
+  DiagDraw (Line, 3);
+  UnicodeSPrint (Line, sizeof (Line), L"WIN  %016lx %lx", Probe->WindowPtr, Probe->Used);
+  DiagDraw (Line, 4);
+  UnicodeSPrint (Line, sizeof (Line), L"FILE %016lx S%lx", Probe->RecFileSig, Probe->RecFileSum);
+  DiagDraw (Line, 5);
+  UnicodeSPrint (Line, sizeof (Line), L"WALL %016lx S%lx", Probe->RecWinSig, Probe->RecWinSum);
+  DiagDraw (Line, 6);
+  UnicodeSPrint (Line, sizeof (Line), L"VNAM %016lx F%lx", Probe->VolNowName, Probe->VolNowFlags);
+  DiagDraw (Line, 7);
+}
+
+STATIC
+VOID
+EFIAPI
+BootWatchdog (EFI_EVENT Event, VOID *Context)
+{
+  UINT32  Mode;
+
+  (VOID)Event;
+  (VOID)Context;
+  Mode = ReadUnaligned32 ((CONST UINT32 *)(UINTN)(BOOT_WATCHDOG_SYSCON + BOOT_WATCHDOG_MODE_OFF));
+  WriteUnaligned32 ((UINT32 *)(UINTN)(BOOT_WATCHDOG_SYSCON + BOOT_WATCHDOG_MODE_OFF),
+                    (Mode & ~BOOT_WATCHDOG_MODE_MASK) | BOOT_WATCHDOG_FASTBOOT);
+  __asm__ volatile ("movz x0, #0x0009\n\tmovk x0, #0x8400, lsl #16\n\tsmc #0" ::: "x0", "memory");
+  CpuDeadLoop ();
+}
+
+STATIC
 EFI_STATUS
 AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
 {
@@ -501,6 +670,7 @@ Boot (
   UINTN                           Attempt;
   CHAR8                           CommandLine[1024];
   UINT64                          Video[6];
+  EFI_EVENT                       Watchdog;
 
   (VOID)This;
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
@@ -522,6 +692,10 @@ Boot (
       }
       CommandLine[Index] = (CHAR8)Request->BootArgs[Index];
     }
+  }
+  Watchdog = NULL;
+  if (!EFI_ERROR (gBS->CreateEvent (EVT_TIMER, TPL_CALLBACK, BootWatchdog, NULL, &Watchdog))) {
+    gBS->SetTimer (Watchdog, TimerRelative, (UINT64)BOOT_WATCHDOG_SECONDS * 10000000ULL);
   }
   Root = NULL;
   Image = NULL;
@@ -618,6 +792,95 @@ Boot (
     CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
              (UINT8 *)Image + Kernel.Segments[Index].FileOffset, (UINTN)Kernel.Segments[Index].FileSize);
   }
+#if DARWINBOOT_LOADER_PROBES
+  {
+    LOADER_PROBE_BLOCK  *Probe;
+    UINT64                    RecFileOff;
+    UINT64                    EntryFileOff;
+    UINT64                    Word0FileOff;
+    UINT8                     *WinRec;
+    UINT8                     *FileRec;
+
+    Probe = (LOADER_PROBE_BLOCK *)(UINTN)(ArgsAddress + LOADER_PROBE_OFFSET);
+    RecFileOff = SegmentFileOffset (&Kernel, LOADER_PROBE_REC_PAGE_VA);
+    EntryFileOff = SegmentFileOffset (&Kernel, Kernel.Entry);
+    Word0FileOff = SegmentFileOffset (&Kernel, Kernel.Base);
+    WinRec = (UINT8 *)(UINTN)(Address + (LOADER_PROBE_REC_PAGE_VA - Kernel.Base));
+    FileRec = (RecFileOff == MAX_UINT64) ? NULL : (UINT8 *)Image + (UINTN)RecFileOff;
+    ZeroMem (Probe, sizeof (*Probe));
+    Probe->Magic = LOADER_PROBE_MAGIC;
+    Probe->VirtualBase = Kernel.Base;
+    Probe->PhysicalBase = Address;
+    Probe->Used = Used;
+    Probe->WindowSize = WindowSize;
+    Probe->Count = Kernel.Count;
+    Probe->Entry = Kernel.Entry;
+    for (Index = 0; (Index < Kernel.Count) && (Index < 32); Index++) {
+      Probe->Segments[Index][0] = Kernel.Segments[Index].Address;
+      Probe->Segments[Index][1] = Kernel.Segments[Index].FileSize;
+    }
+    Probe->RecFileOffset = RecFileOff;
+    Probe->EntryFileOffset = EntryFileOff;
+    Probe->RecWinSig = ReadUnaligned64 ((CONST UINT64 *)WinRec);
+    Probe->RecWinName = ReadUnaligned64 ((CONST UINT64 *)(WinRec + LOADER_PROBE_NAME_OFF));
+    Probe->RecWinFlags = ReadUnaligned64 ((CONST UINT64 *)(WinRec + LOADER_PROBE_FLAGS_OFF));
+    Probe->RecWinSum = PageByteSum (WinRec, EFI_PAGE_SIZE);
+    Probe->EntryWin = ReadUnaligned64 ((CONST UINT64 *)(UINTN)(Address + Kernel.Entry - Kernel.Base));
+    Probe->Word0Win = ReadUnaligned64 ((CONST UINT64 *)(UINTN)Address);
+    if (FileRec != NULL) {
+      Probe->RecFileSig = ReadUnaligned64 ((CONST UINT64 *)FileRec);
+      Probe->RecFileName = ReadUnaligned64 ((CONST UINT64 *)(FileRec + LOADER_PROBE_NAME_OFF));
+      Probe->RecFileFlags = ReadUnaligned64 ((CONST UINT64 *)(FileRec + LOADER_PROBE_FLAGS_OFF));
+      Probe->RecCompare = (UINT64)CompareMem (WinRec, FileRec, EFI_PAGE_SIZE);
+      Probe->RecFileSum = PageByteSum (FileRec, EFI_PAGE_SIZE);
+    } else {
+      Probe->RecCompare = MAX_UINT64;
+    }
+    if (EntryFileOff != MAX_UINT64) {
+      Probe->EntryFile = ReadUnaligned64 ((CONST UINT64 *)((UINT8 *)Image + (UINTN)EntryFileOff));
+    }
+    if (Word0FileOff != MAX_UINT64) {
+      Probe->Word0File = ReadUnaligned64 ((CONST UINT64 *)((UINT8 *)Image + (UINTN)Word0FileOff));
+    }
+    {
+      PAYLOAD_PROBE_BLOCK  VolProbe;
+
+      CopyMem (&VolProbe, (VOID *)(UINTN)PAYLOAD_PROBE_PAGE, sizeof (VolProbe));
+      if (VolProbe.Magic == PAYLOAD_PROBE_MAGIC) {
+        Probe->VolMagic       = VolProbe.Magic;
+        Probe->VolDestination = VolProbe.Destination;
+        Probe->VolSize        = VolProbe.Size;
+        Probe->VolRecSig      = VolProbe.RecSig;
+        Probe->VolRecName     = VolProbe.RecName;
+        Probe->VolRecFlags    = VolProbe.RecFlags;
+        Probe->VolEntry       = VolProbe.Entry;
+      }
+    }
+    //
+    // diag73: does the decompressed volume still hold the record page at probe time? Read it straight
+    // from the volume's physical memory (VNOW), paint the rows here, and paint them again before
+    // ExitBootServices. The diag72 fresh file re-read is gone: with it in place the loader never
+    // painted and the boot never reached the kernel.
+    //
+    Probe->ImagePtr = (UINT64)(UINTN)Image;
+    Probe->ImageSize = (UINT64)ImageSize;
+    Probe->WindowPtr = Address;
+    if ((Probe->VolMagic == PAYLOAD_PROBE_MAGIC) && (Probe->VolDestination != 0) &&
+        (Probe->VolSize >= PAYLOAD_PROBE_VOL_REC + EFI_PAGE_SIZE)) {
+      CONST UINT8  *VolNow;
+
+      VolNow = (CONST UINT8 *)(UINTN)(Probe->VolDestination + PAYLOAD_PROBE_VOL_REC);
+      Probe->VolNowSig   = ReadUnaligned64 ((CONST UINT64 *)VolNow);
+      Probe->VolNowName  = ReadUnaligned64 ((CONST UINT64 *)(VolNow + LOADER_PROBE_NAME_OFF));
+      Probe->VolNowFlags = ReadUnaligned64 ((CONST UINT64 *)(VolNow + LOADER_PROBE_FLAGS_OFF));
+      Probe->VolNowSum   = PageByteSum (VolNow, EFI_PAGE_SIZE);
+      if (Probe->VolSize >= PAYLOAD_PROBE_VOL_ENTRY + 8) {
+        Probe->VolEntryNow = ReadUnaligned64 ((CONST UINT64 *)(UINTN)(Probe->VolDestination + PAYLOAD_PROBE_VOL_ENTRY));
+      }
+    }
+    DiagProbeRows (Probe);
+  }
+#endif
   Args = (DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress;
   Args->Revision = 2;
   Args->Version = 2;
@@ -655,8 +918,8 @@ Boot (
   Root->Close (Root); Root = NULL;
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
   if (EFI_ERROR (Status)) { goto Fail; }
-  Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
-         Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
+  Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx used=0x%lx\n",
+         Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize, (UINT64)Used);
   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
   Print (L"DARWINBOOT: command line: %a\n", CommandLine);
@@ -670,18 +933,31 @@ Boot (
   DEBUG ((DEBUG_ERROR, "\fDARWINBOOT: hand-off to the kernel\n\n"));
   DEBUG ((DEBUG_ERROR, "kernel   va 0x%lx  pa 0x%lx\n", Kernel.Base, Address));
   DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + Kernel.Entry - Kernel.Base));
-  DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize));
+  DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes  used 0x%lx\n", ArgsAddress, (UINT64)WindowSize, (UINT64)Used));
   DEBUG ((DEBUG_ERROR, "video    base 0x%lx  %lux%lu  row %lu bytes  %lu bpp\n", Video[0], Video[3], Video[4], Video[2], Video[5]));
   DEBUG ((DEBUG_ERROR, "entry words %08x %08x %08x %08x\n",
           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 4)),
           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 8)),
           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 12))));
-  DEBUG ((DEBUG_ERROR, "CurrentEL %lu  SCTLR_EL1 0x%lx  TCR_EL1 0x%lx\n", DarwinCurrentEl () >> 2, READ_SYSREG (sctlr_el1), READ_SYSREG (tcr_el1)));
+  Print (L"DARWINBOOT: entry words %08x %08x %08x %08x\n",
+         ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
+         ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 4)),
+         ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 8)),
+         ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 12)));
+  Print (L"DARWINBOOT: EL%lu SCTLR 0x%lx TCR 0x%lx\n",
+         (UINT64)(DarwinCurrentEl () >> 2), READ_SYSREG (sctlr_el1), READ_SYSREG (tcr_el1));
   DEBUG ((DEBUG_ERROR, "ID_AA64MMFR0_EL1 0x%lx  (PARange %lu, 4 KiB granule %a)\n", READ_SYSREG (id_aa64mmfr0_el1),
           READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
   DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
   DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmarks the loader handoff before the kernel branch.\n"));
+  //
+  // Diag72 paint goes after every firmware console print and before ExitBootServices; the kernel's entry
+  // cave draws at y=1200 and below, these rows sit at height/4 .. height/4+9*56.
+  //
+#if DARWINBOOT_LOADER_PROBES
+  DiagProbeRows ((LOADER_PROBE_BLOCK *)(UINTN)(ArgsAddress + LOADER_PROBE_OFFSET));
+#endif
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
@@ -691,7 +967,7 @@ Boot (
     }
     Status = gBS->ExitBootServices (mImage, Key);
     if (!EFI_ERROR (Status)) {
-      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
+      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4], Used);
       CpuDeadLoop ();
     }
     if (Status != EFI_INVALID_PARAMETER) { CpuDeadLoop (); }
@@ -699,6 +975,7 @@ Boot (
   CpuDeadLoop ();
   return EFI_ABORTED;
 Fail:
+  if (Watchdog != NULL) { gBS->SetTimer (Watchdog, TimerCancel, 0); gBS->CloseEvent (Watchdog); }
   if (Root != NULL) { Root->Close (Root); }
   if (Image != NULL) { FreePool (Image); }
   if (Tree != NULL) { FreePool (Tree); }
