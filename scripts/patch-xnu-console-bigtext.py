@@ -224,6 +224,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('kernel', type=Path, help='the kernel COPY to patch in place')
     parser.add_argument('--cave', type=lambda s: int(s, 0), help='__TEXT_EXEC VA for the renderer when the built-in cave is no longer empty')
+    parser.add_argument('--cave-end', type=lambda s: int(s, 0), help='end VA of the zero run holding the --cave (defaults to the end of __TEXT_EXEC)')
     args = parser.parse_args()
 
     data = bytearray(args.kernel.read_bytes())
@@ -240,7 +241,14 @@ def main():
 
     text_exec = segments['__TEXT_EXEC']
     cave_va = CAVE_VA if args.cave is None else args.cave
-    cave_region = CAVE_REGION if args.cave is None else (cave_va, text_exec[0] + text_exec[1])
+    if args.cave is None:
+        cave_region = CAVE_REGION
+    elif args.cave_end is None:
+        cave_region = (cave_va, text_exec[0] + text_exec[1])
+    else:
+        cave_region = (cave_va, args.cave_end)
+    if not cave_va < cave_region[1] <= text_exec[0] + text_exec[1]:
+        raise SystemExit(f'cave region {cave_region[0]:#x}..{cave_region[1]:#x} is empty or outside __TEXT_EXEC')
     for va, label in ((hook_va, 'hook'), (cave_va, 'cave')):
         if not text_exec[0] <= va < text_exec[0] + text_exec[1]:
             raise SystemExit(f'{label} {va:#x} is outside __TEXT_EXEC; this is not the kernel these patches are for')

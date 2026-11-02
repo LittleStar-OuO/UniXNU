@@ -1118,7 +1118,12 @@ def skip_panic_log(data, names):
     delta -= (1 << 26) if delta & (1 << 25) else 0
     if call >> 26 != 0b100101 or va + 0x20 + delta * 4 != names.get('_ml_io_map_wcomb'):
         raise SystemExit(f'_PE_create_console does not call _ml_io_map_wcomb at {va + 0x20:#x}')
-    if [word(va + offset) for offset in (0x94, 0xa4)] != [0xf0ffc2c0, 0x1a941681]:
+    # The tail's first adrp encodes a page distance from this function and the add's
+    # page offset moves with any __TEXT cstring growth, so only their shapes
+    # (adrp x0; add x0, x0, #imm) are stable across prelink layouts; the rest is exact.
+    if (word(va + 0x94) & 0x9F00001F) != 0x90000000 or \
+            (word(va + 0x98) & 0xFFC003FF) != 0x91000000 or \
+            [word(va + offset) for offset in (0x9c, 0xa0, 0xa4)] != [0xf9401408, 0xf100011f, 0x1a941681]:
         raise SystemExit(f'_PE_create_console video console tail is not where it was at {va:#x}')
     struct.pack_into('<I', data, file_offset(va + 0x14), 0x52800034)   # mov w20, #1
     struct.pack_into('<I', data, file_offset(va + 0x18), branch(va + 0x18, va + 0x94))
