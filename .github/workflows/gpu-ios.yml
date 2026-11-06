@@ -64,8 +64,9 @@ jobs:
           sparse = list(dict.fromkeys(list(mesa['sparse_directories']) + ['src/panfrost']))
           subprocess.run(['git', '-C', str(src), 'sparse-checkout', 'init', '--cone'], check=True)
           subprocess.run(['git', '-C', str(src), 'sparse-checkout', 'set', *sparse], check=True)
-          subprocess.run(['git', '-C', str(src), 'fetch', '--depth=1', 'origin', mesa['commit']], check=True)
-          subprocess.run(['git', '-C', str(src), 'checkout', mesa['commit']], check=True)
+          if subprocess.run(['git', '-C', str(src), 'checkout', mesa['commit']]).returncode:
+              subprocess.run(['git', '-C', str(src), 'fetch', 'origin', mesa['commit']], check=True)
+              subprocess.run(['git', '-C', str(src), 'checkout', mesa['commit']], check=True)
           for patch in pins['patches']:
               print('applying', patch)
               subprocess.run(['git', '-C', str(src), 'apply', patch], check=True)
