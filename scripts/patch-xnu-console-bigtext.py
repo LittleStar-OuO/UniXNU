@@ -28,12 +28,8 @@ ROWS = 40
 HOOK_PROLOGUE = 0xD10103FF  # sub sp, sp, #0x40
 
 RENDERER = r"""
-    .equ COLS, 40
-    .equ ROWS, 20
-    .equ WIN_X0, 1280
-    .equ WIN_Y0, 1280
-    .equ WIN_W, 5120
-    .equ WIN_H, 1280
+    .equ COLS, 50
+    .equ ROWS, 40
     .text
     .global _start
 _start:
@@ -45,32 +41,23 @@ _start:
     ldr w3, [x1, #8]
     cmp w3, #32
     b.ne out
+    ldr w5, [x1, #0]
     ldr w6, [x1, #0xc]
     cbz x6, out
-    ldr w5, [x1]
-    cmp x5, #WIN_Y0+WIN_H
-    b.lo out
     ldr x7, =state
     ldr x8, [x7, #16]
     ldr x1, =magic
     cmp x8, x1
     b.eq ready
     mov x14, x2
-    mov x13, #WIN_Y0
-    mul x13, x13, x6
-    add x14, x14, x13
-    add x14, x14, #WIN_X0
-    mov x15, #WIN_H
-clear_row:
-    mov x3, x14
-    mov x16, #WIN_W
-clear_col:
-    str xzr, [x3], #8
-    sub x16, x16, #8
-    cbnz x16, clear_col
-    add x14, x14, x6
-    sub x15, x15, #1
-    cbnz x15, clear_row
+    mul x3, x5, x6
+    mov x1, xzr
+clear_loop:
+    cbz x3, clear_done
+    str x1, [x14], #8
+    sub x3, x3, #8
+    b clear_loop
+clear_done:
     str xzr, [x7]
     str xzr, [x7, #8]
     ldr x1, =magic
@@ -116,21 +103,13 @@ out:
     mov x30, x4
     ret
 draw_glyph:
-    ldr x1, =vinfo
-    ldr w5, [x1]
-    cmp x5, #WIN_Y0+WIN_H
-    b.lo dg_out
-    cbz x6, dg_out
-    mov x13, #WIN_Y0
-    lsl x14, x10, #6
-    add x13, x13, x14
-    mul x13, x13, x6
-    add x13, x2, x13
-    add x13, x13, #WIN_X0
-    lsl x14, x9, #7
-    add x12, x13, x14
     ldr x11, =iso_font
     add x11, x11, w0, uxtw #4
+    lsl x13, x10, #6
+    mul x13, x13, x6
+    add x13, x2, x13
+    lsl x14, x9, #7
+    add x12, x13, x14
     mov w14, #-1
     mov x15, #0
 glyph_rows:
@@ -163,49 +142,26 @@ next_bit:
     add x15, x15, #1
     cmp x15, #16
     b.lo glyph_rows
-dg_out:
     ret
 scroll:
-    ldr x1, =vinfo
-    ldr w5, [x1]
-    cmp x5, #WIN_Y0+WIN_H
-    b.lo scroll_text
-    ldr x6, [x1, #0xc]
-    cbz x6, scroll_text
-    mov x13, #WIN_Y0
-    mul x13, x13, x6
-    add x13, x2, x13
-    add x13, x13, #WIN_X0
+    mul x14, x5, x6
     lsl x8, x6, #6
-    add x1, x13, x8
-    mov x3, x13
-    mov x11, #WIN_W
-    sub x11, x6, x11
-    mov x15, #WIN_H-64
-sc_row:
-    cbz x15, sc_clear
-    mov x16, #WIN_W
-sc_px:
+    sub x15, x14, x8
+    add x1, x2, x8
+    mov x3, x2
+scroll_copy:
+    cbz x15, scroll_clear
     ldr x17, [x1], #8
     str x17, [x3], #8
-    sub x16, x16, #8
-    cbnz x16, sc_px
-    add x1, x1, x11
-    add x3, x3, x11
-    sub x15, x15, #1
-    b sc_row
-sc_clear:
-    mov x15, #64
-sc_crow:
-    cbz x15, scroll_text
-    mov x16, #WIN_W
-sc_cpx:
-    str xzr, [x3], #8
-    sub x16, x16, #8
-    cbnz x16, sc_cpx
-    add x3, x3, x11
-    sub x15, x15, #1
-    b sc_crow
+    sub x15, x15, #8
+    b scroll_copy
+scroll_clear:
+    mov w14, wzr
+scroll_fill:
+    cbz x8, scroll_text
+    str w14, [x3], #4
+    sub x8, x8, #4
+    b scroll_fill
 scroll_text:
     ldr x11, =text
     mov x13, #(ROWS-1)*COLS
@@ -236,11 +192,8 @@ refresh:
     ldr w3, [x1, #8]
     cmp w3, #32
     b.ne out2
-    ldr x6, [x1, #0xc]
+    ldr w6, [x1, #0xc]
     cbz x6, out2
-    ldr w5, [x1]
-    cmp x5, #WIN_Y0+WIN_H
-    b.lo out2
     ldr x7, =state
     ldr x8, [x7, #16]
     ldr x1, =magic
@@ -353,7 +306,7 @@ def main():
     segments = load_segments(data)
 
     symbols = kernel_symbols(args.kernel)
-    needed = ('_console_write_unbuffered', '_iso_font', '_vinfo', '_native_legacy_client_status')
+    needed = ('_console_write_unbuffered', '_iso_font', '_vinfo')
     missing = [name for name in needed if name not in symbols]
     if missing:
         raise SystemExit(f'symbols missing: {missing}')
@@ -406,7 +359,7 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         code = assemble(cave_va, {'iso_font': font_va, 'vinfo': vinfo_va, 'state': STATE_VA, 'magic': MAGIC,
-                                  'text': STATE_VA + 0x20, 'client': symbols['_native_legacy_client_status']}, Path(tmp))
+                                  'text': STATE_VA + 0x20}, Path(tmp))
         refresh_va = refresh_address(Path(tmp))
     if len(code) > cave_region[1] - cave_va:
         raise SystemExit(f'renderer is {len(code):#x} bytes, does not fit the cave')
@@ -448,7 +401,7 @@ def main():
         print(f'refresh hook {refresh_hook_va:#x} -> {jump2:#010x} (b {refresh_va:#x})')
     print(f'renderer {len(code):#x} bytes at {cave_va:#x} (cave {cave_region[0]:#x}..{cave_region[1]:#x})')
     print(f'font {font_va:#x} vinfo {vinfo_va:#x} state {STATE_VA:#x} magic {MAGIC:#x}')
-    print(f'40x20 window console, re-stamped after presents, {len(data)} bytes total')
+    print(f'grid {COLS}x{ROWS} cells 32x64, re-stamped after presents, {len(data)} bytes total')
 
 
 if __name__ == '__main__':
