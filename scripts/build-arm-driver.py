@@ -76,7 +76,7 @@ while index < len(arguments):
     elif not value.startswith('-W'):
         command.append(value)
     index += 1
-command.extend(['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+command.extend(['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-missing-designated-field-initializers',
                 '-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
                 '-Wno-unnecessary-virtual-specifier', '-I', str(ROOT / '.cache/xnu-work/osfmk')])
 if component in ('NativeVirtioBlock', 'NativeRamBlock', 'NativeUfs'):
