@@ -103,8 +103,33 @@ require(undefined==set(bindings),'All and only actual original HID imports bound
 asm=OUT/'original-bindings.S';asm.write_text(''.join(f'.globl {n}\n.set {n}, {a:#x}\n' for n,a in sorted(bindings.items())))
 sdk=run(['xcrun','--sdk','iphoneos','--show-sdk-path'],text=True).strip()
 run(['xcrun','clang','-target','arm64-apple-ios17.0','-isysroot',sdk,'-c',asm,'-o',OUT/'hid-original-bindings.o'])
-llvm=Path(run(['brew','--prefix','llvm'],text=True).strip())/'bin';late=OUT/'NativeHidInput.late.o'
-run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeHidInput.cpp',obj,late])
+late=OUT/'NativeHidInput.late.o'
+def late_stage(src,dst,target):
+    data=bytearray(Path(src).read_bytes())
+    magic,cputype,cpusubtype,filetype,ncmds,sizeofcmds,flags=struct.unpack_from('<IiiIIII',data,0)
+    require(magic==0xfeedfacf,'late object must be Mach-O')
+    off=32
+    for _ in range(ncmds):
+        cmd,size=struct.unpack_from('<II',data,off)
+        if cmd==0x19:
+            nsects=struct.unpack_from('<I',data,off+64)[0]
+            for i in range(nsects):
+                s0=off+72+i*80
+                name=bytes(data[s0:s0+16]).split(bytes([0]))[0]
+                if name==b'__mod_init_func':
+                    data[s0:s0+16]=b'__tb365fc_noop'.ljust(16,bytes([0]))
+        elif cmd==0x2:
+            symoff,nsyms,stroff,strsize=struct.unpack_from('<4I',data,off+8)
+            for i in range(nsyms):
+                n=symoff+i*16
+                strx=struct.unpack_from('<I',data,n)[0]
+                if strx==0:continue
+                end=data.find(bytes([0]),stroff+strx)
+                if bytes(data[stroff+strx:end])==target.encode():
+                    data[n+4]|=1
+        off+=size
+    Path(dst).write_bytes(bytes(data))
+late_stage(obj,late,'__GLOBAL__sub_I_NativeHidInput.cpp')
 def code(data,image):
     s=next(s for g in image['segments'] for s in g['sections'] if s['name']=='__text');return data[s['fileoff']:s['fileoff']+s['size']]
 require(code(raw,om)==code(late.read_bytes(),macho(late.read_bytes())),'Owned code unchanged by deferred metaclass registration')

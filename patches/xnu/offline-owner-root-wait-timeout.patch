@@ -1,0 +1,16 @@
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -55,10 +55,12 @@
+ #include <kdp/sk_core.h>
+ 
+ // how long to wait for matching root device, secs
++// TB365FC: the UFS root windows publish only after the verified reads of the
++// owner image set finish, minutes after boot; the stock 60 s gives up first.
+ #if DEBUG
+ #define ROOTDEVICETIMEOUT       120
+ #else
+-#define ROOTDEVICETIMEOUT       60
++#define ROOTDEVICETIMEOUT       600
+ #endif
+ 
+ extern dev_t mdevadd(int devid, uint64_t base, unsigned int size, int phys);
